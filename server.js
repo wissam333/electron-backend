@@ -25,18 +25,6 @@ app.use(express.json({ limit: "5mb" }));
 app.use((req, res, next) => {
   if (req.path === "/health") return next();
   const auth = req.headers["authorization"] ?? "";
-  console.log("[auth] header:", auth, "expected:", process.env.SYNC_TOKEN);
-  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
-  if (!process.env.SYNC_TOKEN || token !== process.env.SYNC_TOKEN) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-  next();
-});
-
-// Bearer token auth — client sends: Authorization: Bearer <token>
-app.use((req, res, next) => {
-  if (req.path === "/health") return next();
-  const auth = req.headers["authorization"] ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
   if (!process.env.SYNC_TOKEN || token !== process.env.SYNC_TOKEN) {
     return res.status(401).json({ error: "Unauthorized" });
@@ -75,14 +63,16 @@ app.get("/health", (_req, res) =>
 app.get("/changes", async (req, res) => {
   try {
     const since = req.query.since ?? "1970-01-01T00:00:00.000Z";
+    const limit = parseInt(req.query.limit ?? "200");
+    const offset = parseInt(req.query.offset ?? "0");
     const tables = [...ALLOWED_TABLES];
     const rows = [];
 
     await Promise.all(
       tables.map(async (table) => {
         const result = await pool.query(
-          `SELECT * FROM "${table}" WHERE updated_at > $1 ORDER BY updated_at ASC`,
-          [since],
+          `SELECT * FROM "${table}" WHERE updated_at > $1 ORDER BY updated_at ASC LIMIT $2 OFFSET $3`,
+          [since, limit, offset],
         );
         for (const row of result.rows) {
           rows.push({ table, row });
@@ -90,12 +80,10 @@ app.get("/changes", async (req, res) => {
       }),
     );
 
-    // Sort all rows across tables by updated_at ascending
     rows.sort(
       (a, b) => new Date(a.row.updated_at) - new Date(b.row.updated_at),
     );
-
-    res.json({ ok: true, rows });
+    res.json({ ok: true, rows, hasMore: rows.length === limit });
   } catch (err) {
     console.error("GET /changes:", err.message);
     res.status(500).json({ error: err.message });
@@ -116,7 +104,7 @@ async function upsertRow(table, row, res) {
     const colList = cols.map((c) => `"${c}"`).join(", ");
     const placeholders = cols.map((_, i) => `$${i + 1}`).join(", ");
     const setClauses = cols
-      .filter((c) => c !== "id")
+      .filter((c) => c !== "id" && c !== "synced_at") // ← add && c !== "synced_at"
       .map((c) => `"${c}" = EXCLUDED."${c}"`)
       .join(", ");
 
@@ -170,6 +158,116 @@ app.delete("/:table/:id", async (req, res) => {
   } catch (err) {
     console.error(`DELETE /${table}/${id}:`, err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ── LICENSE ───────────────────────────────────────────────────────────────────
+
+// Activate a license key on a machine
+app.post("/license/activate", async (req, res) => {
+  const { key, machine_id } = req.body;
+  if (!key || !machine_id)
+    return res
+      .status(400)
+      .json({ ok: false, error: "Missing key or machine_id" });
+
+  try {
+    const result = await pool.query(`SELECT * FROM licenses WHERE key = $1`, [
+      key,
+    ]);
+
+    const license = result.rows[0];
+
+    if (!license)
+      return res.status(404).json({ ok: false, error: "Invalid license key" });
+
+    if (!license.is_active)
+      return res
+        .status(403)
+        .json({ ok: false, error: "License is deactivated" });
+
+    if (license.expires_at && new Date(license.expires_at) < new Date())
+      return res.status(403).json({ ok: false, error: "License expired" });
+
+    // Already activated on a different machine
+    if (license.machine_id && license.machine_id !== machine_id)
+      return res
+        .status(403)
+        .json({ ok: false, error: "License already used on another device" });
+
+    // Activate
+    await pool.query(
+      `UPDATE licenses SET machine_id = $1, activated_at = NOW() WHERE key = $2`,
+      [machine_id, key],
+    );
+
+    res.json({ ok: true, expires_at: license.expires_at });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Verify a license (called on every launch)
+app.post("/license/verify", async (req, res) => {
+  const { key, machine_id } = req.body;
+  if (!key || !machine_id)
+    return res
+      .status(400)
+      .json({ ok: false, error: "Missing key or machine_id" });
+
+  try {
+    const result = await pool.query(`SELECT * FROM licenses WHERE key = $1`, [
+      key,
+    ]);
+
+    const license = result.rows[0];
+
+    if (!license)
+      return res.status(404).json({ ok: false, error: "Invalid license key" });
+
+    if (!license.is_active)
+      return res.status(403).json({ ok: false, error: "License deactivated" });
+
+    if (license.machine_id !== machine_id)
+      return res
+        .status(403)
+        .json({ ok: false, error: "License not valid for this device" });
+
+    if (license.expires_at && new Date(license.expires_at) < new Date())
+      return res.status(403).json({ ok: false, error: "License expired" });
+
+    res.json({ ok: true, expires_at: license.expires_at });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Deactivate — release from machine so user can move to new PC
+app.post("/license/deactivate", async (req, res) => {
+  const { key, machine_id } = req.body;
+  if (!key || !machine_id)
+    return res.status(400).json({ ok: false, error: "Missing fields" });
+
+  try {
+    const result = await pool.query(`SELECT * FROM licenses WHERE key = $1`, [
+      key,
+    ]);
+
+    const license = result.rows[0];
+    if (!license)
+      return res.status(404).json({ ok: false, error: "Invalid key" });
+
+    if (license.machine_id !== machine_id)
+      return res.status(403).json({ ok: false, error: "Not your license" });
+
+    await pool.query(
+      `UPDATE licenses SET machine_id = NULL, activated_at = NULL WHERE key = $1`,
+      [key],
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
