@@ -23,7 +23,11 @@ const pool = new Pool({
 app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: "5mb" }));
 app.use((req, res, next) => {
+  // Public routes — no auth needed
   if (req.path === "/health") return next();
+  if (req.path.startsWith("/license")) return next();
+
+  // Sync routes require bearer token
   const auth = req.headers["authorization"] ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
   if (!process.env.SYNC_TOKEN || token !== process.env.SYNC_TOKEN) {
