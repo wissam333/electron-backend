@@ -113,9 +113,7 @@ async function upsertRow(table, row, res) {
 
   await pool.query(
     `INSERT INTO "${table}" (${colList}) VALUES (${placeholders})
-     ON CONFLICT (id) DO UPDATE SET ${setClauses},
-       synced_at = NOW(),
-       updated_at = GREATEST("${table}".updated_at, EXCLUDED.updated_at)`,
+     ON CONFLICT (id) DO UPDATE SET ${setClauses}, synced_at = NOW()`,
     vals,
   );
 
