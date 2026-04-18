@@ -1,26 +1,37 @@
 // sync-backend/server.js
+import dotenv from "dotenv";
+dotenv.config();
+
 import express from "express";
 import pg from "pg";
 import cors from "cors";
-import dotenv from "dotenv";
-
-dotenv.config();
 
 const { Pool } = pg;
 const app = express();
 
 // ── DB Pool ───────────────────────────────────────────────────────────────────
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl:
-    process.env.NODE_ENV === "production"
-      ? { rejectUnauthorized: false }
-      : false,
+  host: process.env.DB_HOST,
+  port: process.env.DB_PORT || 5432,
+  database: process.env.DB_NAME,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASS,
+  ssl: { rejectUnauthorized: false },
 });
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: "5mb" }));
+app.use((req, res, next) => {
+  if (req.path === "/health") return next();
+  const auth = req.headers["authorization"] ?? "";
+  console.log("[auth] header:", auth, "expected:", process.env.SYNC_TOKEN);
+  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  if (!process.env.SYNC_TOKEN || token !== process.env.SYNC_TOKEN) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+});
 
 // Bearer token auth — client sends: Authorization: Bearer <token>
 app.use((req, res, next) => {
@@ -97,27 +108,28 @@ app.get("/changes", async (req, res) => {
 //        DELETE /:table/:id → soft-delete
 // ─────────────────────────────────────────────────────────────────────────────
 async function upsertRow(table, row, res) {
-  if (!row || !row.id) {
-    return res.status(400).json({ error: "Missing row.id" });
+  console.log("[upsertRow] table:", table, "row:", JSON.stringify(row));
+  try {
+    const cols = Object.keys(row);
+    const vals = Object.values(row);
+
+    const colList = cols.map((c) => `"${c}"`).join(", ");
+    const placeholders = cols.map((_, i) => `$${i + 1}`).join(", ");
+    const setClauses = cols
+      .filter((c) => c !== "id")
+      .map((c) => `"${c}" = EXCLUDED."${c}"`)
+      .join(", ");
+
+    const sql = `INSERT INTO "${table}" (${colList}) VALUES (${placeholders}) ON CONFLICT (id) DO UPDATE SET ${setClauses}, synced_at = NOW()`;
+    console.log("[sql]", sql);
+    console.log("[vals]", vals);
+
+    await pool.query(sql, vals);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[upsertRow error]", err); // full error object
+    res.status(500).json({ error: err.message });
   }
-
-  const cols = Object.keys(row);
-  const vals = Object.values(row);
-
-  const colList = cols.map((c) => `"${c}"`).join(", ");
-  const placeholders = cols.map((_, i) => `$${i + 1}`).join(", ");
-  const setClauses = cols
-    .filter((c) => c !== "id")
-    .map((c) => `"${c}" = EXCLUDED."${c}"`)
-    .join(", ");
-
-  await pool.query(
-    `INSERT INTO "${table}" (${colList}) VALUES (${placeholders})
-     ON CONFLICT (id) DO UPDATE SET ${setClauses}, synced_at = NOW()`,
-    vals,
-  );
-
-  res.json({ ok: true });
 }
 
 app.post("/:table", async (req, res) => {
